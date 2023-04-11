@@ -176,6 +176,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 	if err := json.NewDecoder(r.Body).Decode(&d); err != nil {
 		log.Printf("json.NewDecoder: %v", err)
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		fmt.Fprintln(w, `{"error": "Internal Server Error"}`)
 		return
@@ -184,6 +185,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	fmt.Printf("%v", d.Extraction.Body)
 	if err != nil {
 		log.Printf("request: %v", err)
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		fmt.Fprintln(w, `{"error": "Internal Server Error"}`)
 		return
@@ -193,6 +195,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		reader, err = t.tweak(reader)
 		if err != nil {
 			log.Printf("tweak: %v", err)
+			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusInternalServerError)
 			fmt.Fprintln(w, `{"error": "Internal Server Error"}`)
 			return
@@ -202,10 +205,13 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	isUpdated, err := uploadFileIfUpdated(d.Loading.Bucket, d.Loading.Object, reader)
 	if err != nil {
 		log.Printf("uploadFileIfUpdated: %v", err)
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		fmt.Fprintln(w, `{"error": "Internal Server Error"}`)
 		return
 	}
 	reader.Close()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, `{"is_updated": %t}`, isUpdated)
 }
