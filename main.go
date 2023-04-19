@@ -189,7 +189,8 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, `{"error": "Internal Server Error"}`)
 		return
 	}
-	reader, err := request(e.Method, e.Url, e.Body)
+	d.Extraction = e
+	reader, err := request(d.Extraction.Method, d.Extraction.Url, d.Extraction.Body)
 	fmt.Printf("%v", d.Extraction.Body)
 	if err != nil {
 		log.Printf("request: %v", err)
