@@ -6,6 +6,7 @@ import (
 	"cloud.google.com/go/storage"
 	"context"
 	"crypto/md5"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"golang.org/x/net/html/charset"
@@ -75,7 +76,18 @@ func unzip(reader io.ReadCloser) (io.ReadCloser, error) {
 	return r.File[0].Open()
 }
 
-func uploadFileIfUpdated(bucket, object string, reader io.Reader) (bool, error) {
+func csvHeader(data []byte) ([]string, error) {
+	// UTF-8 with BOM
+	if data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF {
+		data = data[3:]
+	}
+
+	r := csv.NewReader(bytes.NewReader(data))
+	r.LazyQuotes = true
+	return r.Read()
+}
+
+func uploadFileIfUpdated(bucket, object string, data []byte) (bool, error) {
 	ctx := context.Background()
 	client, err := storage.NewClient(ctx)
 	if err != nil {
@@ -84,10 +96,6 @@ func uploadFileIfUpdated(bucket, object string, reader io.Reader) (bool, error) 
 	}
 	defer client.Close()
 
-	data, err := io.ReadAll(reader)
-	if err != nil {
-		return false, err
-	}
 	o := client.Bucket(bucket).Object(object)
 	attrs, err := o.Attrs(ctx)
 
@@ -176,6 +184,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		Loading       Loading
 	}
 
+	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewDecoder(r.Body).Decode(&d); err != nil {
 		log.Printf("json.NewDecoder: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
@@ -194,7 +203,6 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	fmt.Printf("%v", d.Extraction.Body)
 	if err != nil {
 		log.Printf("request: %v", err)
-		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		fmt.Fprintln(w, `{"error": "Internal Server Error"}`)
 		return
@@ -204,25 +212,47 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		reader, err = t.tweak(reader)
 		if err != nil {
 			log.Printf("tweak: %v", err)
-			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusInternalServerError)
 			fmt.Fprintln(w, `{"error": "Internal Server Error"}`)
 			return
 		}
 	}
 
-	isUpdated, err := uploadFileIfUpdated(d.Loading.Bucket, d.Loading.Object, reader)
+	data, err := io.ReadAll(reader)
+	reader.Close()
 	if err != nil {
-		log.Printf("uploadFileIfUpdated: %v", err)
-		w.Header().Set("Content-Type", "application/json")
+		log.Printf("io.ReadAll: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		fmt.Fprintln(w, `{"error": "Internal Server Error"}`)
 		return
 	}
-	reader.Close()
-	w.Header().Set("Content-Type", "application/json")
+	header, err := csvHeader(data)
+	if err != nil {
+		log.Printf("csvHeader: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintln(w, `{"error": "Internal Server Error"}`)
+		return
+	}
+	isUpdated, err := uploadFileIfUpdated(d.Loading.Bucket, d.Loading.Object, data)
+	if err != nil {
+		log.Printf("uploadFileIfUpdated: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintln(w, `{"error": "Internal Server Error"}`)
+		return
+	}
+	b, err := json.Marshal(map[string]any{
+		"names":      header,
+		"is_updated": isUpdated,
+	})
+	if err != nil {
+		log.Printf("json.Marshal: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintln(w, `{"error": "Internal Server Error"}`)
+		return
+	}
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, `{"is_updated": %t}`, isUpdated)
+	fmt.Fprint(w)
+	fmt.Fprintf(w, string(b))
 }
 
 func formatMap(templates map[string]string, pattern *regexp.Regexp, content string) map[string]string {
