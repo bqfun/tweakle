@@ -14,6 +14,7 @@ import (
 	"net/http"
 	neturl "net/url"
 	"os"
+	"regexp"
 	"strings"
 )
 
@@ -169,19 +170,26 @@ type Loading struct {
 
 func handler(w http.ResponseWriter, r *http.Request) {
 	var d struct {
-		Extraction Extraction
-		Tweaks     []Tweak
-		Loading    Loading
+		PreExtraction PreExtraction
+		Extraction    Extraction
+		Tweaks        []Tweak
+		Loading       Loading
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&d); err != nil {
 		log.Printf("json.NewDecoder: %v", err)
-		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		fmt.Fprintln(w, `{"error": "Internal Server Error"}`)
 		return
 	}
-	reader, err := request(d.Extraction.Method, d.Extraction.Url, d.Extraction.Body)
+	e, err := d.PreExtraction.preExtract(d.Extraction)
+	if err != nil {
+		log.Printf("preExtract: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintln(w, `{"error": "Internal Server Error"}`)
+		return
+	}
+	reader, err := request(e.Method, e.Url, e.Body)
 	fmt.Printf("%v", d.Extraction.Body)
 	if err != nil {
 		log.Printf("request: %v", err)
@@ -214,4 +222,52 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, `{"is_updated": %t}`, isUpdated)
+}
+
+func formatMap(templates map[string]string, pattern *regexp.Regexp, content string) map[string]string {
+	matches := pattern.FindAllStringSubmatchIndex(content, -1)
+
+	m := make(map[string]string)
+	for key := range templates {
+		template := templates[key]
+		var result []byte
+		for _, submatches := range matches {
+			result = pattern.ExpandString(result, template, content, submatches)
+		}
+		m[key] = string(result)
+	}
+	return m
+}
+
+type PreExtraction struct {
+	Method  string
+	Url     string
+	Body    map[string]string
+	Pattern string
+}
+
+func (p PreExtraction) preExtract(e Extraction) (Extraction, error) {
+	if p.Method == "" && p.Url == "" {
+		return e, nil
+	}
+	reader, err := request(p.Method, p.Url, p.Body)
+	if err != nil {
+		return e, err
+	}
+	defer reader.Close()
+
+	b, err := io.ReadAll(reader)
+	if err != nil {
+		log.Fatal(err)
+	}
+	content := string(b)
+	pattern := regexp.MustCompile(p.Pattern)
+
+	body := formatMap(e.Body, pattern, content)
+
+	return Extraction{
+		e.Method,
+		e.Url,
+		body,
+	}, nil
 }
