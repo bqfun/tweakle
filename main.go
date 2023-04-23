@@ -2,10 +2,10 @@ package main
 
 import (
 	"archive/zip"
+	"bufio"
 	"bytes"
-	"cloud.google.com/go/storage"
+	"cloud.google.com/go/bigquery"
 	"context"
-	"crypto/md5"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
@@ -52,8 +52,12 @@ func request(method, url string, body map[string]string) (io.ReadCloser, error) 
 	return resp.Body, nil
 }
 
-func convert(label string, r io.ReadCloser) (io.Reader, error) {
-	return charset.NewReaderLabel(label, r)
+func convert(label string, r io.ReadCloser) (io.ReadCloser, error) {
+	nr, err := charset.NewReaderLabel(label, r)
+	if err != nil {
+		return nil, err
+	}
+	return ChainedCloser{nr, r}, nil
 }
 
 func unzip(reader io.ReadCloser) (io.ReadCloser, error) {
@@ -76,51 +80,64 @@ func unzip(reader io.ReadCloser) (io.ReadCloser, error) {
 	return r.File[0].Open()
 }
 
-func csvHeader(data []byte) ([]string, error) {
-	// UTF-8 with BOM
-	if data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF {
-		data = data[3:]
+func csvHeader(r io.Reader) ([]string, io.Reader, error) {
+	br := bufio.NewReader(r)
+	bom, err := br.Peek(3)
+	if err != nil {
+		return nil, nil, err
 	}
-
-	r := csv.NewReader(bytes.NewReader(data))
-	r.LazyQuotes = true
-	return r.Read()
+	// UTF-8 with BOM
+	if bom[0] == 0xEF && bom[1] == 0xBB && bom[2] == 0xBF {
+		br.Discard(3)
+	}
+	rr := csv.NewReader(br)
+	rr.LazyQuotes = true
+	header, err := rr.Read()
+	if err != nil {
+		return nil, nil, err
+	}
+	return header, br, nil
 }
 
-func uploadFileIfUpdated(bucket, object string, data []byte) (bool, error) {
-	ctx := context.Background()
-	client, err := storage.NewClient(ctx)
+func load(projectID string, datasetID string, tableID string, r io.ReadCloser) error {
+	header, br, err := csvHeader(r)
+	defer r.Close()
+
 	if err != nil {
-		log.Printf("storage.NewClient: %v", err)
-		return false, err
-	}
-	defer client.Close()
-
-	o := client.Bucket(bucket).Object(object)
-	attrs, err := o.Attrs(ctx)
-
-	if err == nil {
-		sum := md5.Sum(data)
-		if bytes.Equal(sum[:], attrs.MD5) {
-			log.Println("Skipped")
-			return false, nil
-		}
-	} else if err != storage.ErrObjectNotExist {
-		log.Printf("ObjectHandle.Attrs: %v", err)
-		return false, err
+		return err
 	}
 
-	wc := o.NewWriter(ctx)
+	ctx := context.Background()
+	client, err := bigquery.NewClient(ctx, projectID)
+	if err != nil {
+		return err
+	}
+	rs := bigquery.NewReaderSource(br)
+	rs.AllowQuotedNewlines = true
 
-	if _, err := wc.Write(data); err != nil {
-		log.Printf("ObjectHandle.NewWriter: %v", err)
-		return false, err
+	schema := make([]*bigquery.FieldSchema, len(header))
+	var invalidCharacters = regexp.MustCompile(`[^\p{L}\p{N}\p{Pc}\p{Pd}\p{M}&%=+:'<>#|]`)
+	for i, v := range header {
+		name := invalidCharacters.ReplaceAllString(v, "_")
+		schema[i] = &bigquery.FieldSchema{Name: name, Type: bigquery.StringFieldType}
 	}
-	if err := wc.Close(); err != nil {
-		log.Printf("Writer.Close: %v", err)
-		return false, err
+	rs.Schema = schema
+
+	ds := client.Dataset(datasetID)
+	loader := ds.Table(tableID).LoaderFrom(rs)
+	loader.WriteDisposition = bigquery.WriteTruncate
+	job, err := loader.Run(ctx)
+	if err != nil {
+		return err
 	}
-	return true, nil
+	status, err := job.Wait(ctx)
+	if err != nil {
+		return err
+	}
+	if status.Err() != nil {
+		return status.Err()
+	}
+	return nil
 }
 
 func main() {
@@ -145,14 +162,13 @@ func (t Tweak) tweak(reader io.ReadCloser) (io.ReadCloser, error) {
 	var nextReader io.ReadCloser
 	var err error
 
-	if t.Call == "unzip" {
+	switch t.Call {
+	case "unzip":
 		nextReader, err = unzip(reader)
-	} else if t.Call == "convert" {
-		var nr io.Reader
-		nr, err = convert(t.Args["charset"], reader)
-		nextReader = ChainedCloser{nr, reader}
-	} else {
-		return nil, fmt.Errorf("unsupported call: %v", t.Call)
+	case "convert":
+		nextReader, err = convert(t.Args["charset"], reader)
+	default:
+		return nil, fmt.Errorf("unsupported call: %s", t.Call)
 	}
 
 	if err != nil {
@@ -172,8 +188,9 @@ type Tweak struct {
 	Args map[string]string
 }
 type Loading struct {
-	Bucket string
-	Object string
+	ProjectID string
+	DatasetID string
+	TableID   string
 }
 
 func handler(w http.ResponseWriter, r *http.Request) {
@@ -218,41 +235,14 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	data, err := io.ReadAll(reader)
-	reader.Close()
-	if err != nil {
-		log.Printf("io.ReadAll: %v", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprintln(w, `{"error": "Internal Server Error"}`)
-		return
-	}
-	header, err := csvHeader(data)
-	if err != nil {
-		log.Printf("csvHeader: %v", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprintln(w, `{"error": "Internal Server Error"}`)
-		return
-	}
-	isUpdated, err := uploadFileIfUpdated(d.Loading.Bucket, d.Loading.Object, data)
-	if err != nil {
-		log.Printf("uploadFileIfUpdated: %v", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprintln(w, `{"error": "Internal Server Error"}`)
-		return
-	}
-	b, err := json.Marshal(map[string]any{
-		"names":      header,
-		"is_updated": isUpdated,
-	})
-	if err != nil {
-		log.Printf("json.Marshal: %v", err)
+	if err := load(d.Loading.ProjectID, d.Loading.DatasetID, d.Loading.TableID, reader); err != nil {
+		log.Printf("load: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		fmt.Fprintln(w, `{"error": "Internal Server Error"}`)
 		return
 	}
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprint(w)
-	fmt.Fprintf(w, string(b))
+	fmt.Fprintln(w, "{}")
 }
 
 func formatMap(templates map[string]string, pattern *regexp.Regexp, content string) map[string]string {
