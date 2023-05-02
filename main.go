@@ -2,10 +2,10 @@ package main
 
 import (
 	"archive/zip"
-	"bufio"
 	"bytes"
-	"cloud.google.com/go/bigquery"
+	"cloud.google.com/go/storage"
 	"context"
+	"crypto/md5"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
@@ -13,9 +13,7 @@ import (
 	"io"
 	"log"
 	"net/http"
-	neturl "net/url"
 	"os"
-	"regexp"
 	"strings"
 )
 
@@ -27,49 +25,61 @@ type ChainedCloser struct {
 func (c ChainedCloser) Read(p []byte) (n int, err error) { return c.r.Read(p) }
 func (c ChainedCloser) Close() error                     { return c.c.Close() }
 
-func request(method, url string, body map[string]string) (io.ReadCloser, error) {
-	v := neturl.Values{}
-	for key, value := range body {
-		v.Set(key, value)
-	}
-	req, err := http.NewRequest(method, url, strings.NewReader(v.Encode()))
+type HTTPExtractor struct {
+	method string
+	url    string
+	body   string
+}
+
+func (e HTTPExtractor) Extract() (io.ReadCloser, error) {
+	req, err := http.NewRequest(e.method, e.url, strings.NewReader(e.body))
 	if err != nil {
 		log.Printf("http.NewRequest: %v", err)
 		return nil, err
 	}
-	if len(v) != 0 {
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	}
-	resp, err := http.DefaultClient.Do(req)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		log.Printf("http.DefaultClient.Do: %v", err)
 		return nil, err
 	}
-	if resp.StatusCode > 299 {
-		return nil, fmt.Errorf("Response failed with status code: %d and\nbody: %s\n", resp.StatusCode, body)
+	if res.StatusCode > 299 {
+		io.Copy(io.Discard, res.Body)
+		res.Body.Close()
+		return nil, fmt.Errorf("Response failed with status code: %d\n", res.StatusCode)
 	}
 
-	return resp.Body, nil
+	return res.Body, nil
 }
 
-func convert(label string, r io.ReadCloser) (io.ReadCloser, error) {
-	nr, err := charset.NewReaderLabel(label, r)
+type Tweaker interface {
+	tweak(reader io.ReadCloser) (io.ReadCloser, error)
+}
+
+type CharsetConverter struct {
+	label string
+}
+
+func (t CharsetConverter) tweak(reader io.ReadCloser) (io.ReadCloser, error) {
+	nr, err := charset.NewReaderLabel(t.label, reader)
 	if err != nil {
 		return nil, err
 	}
-	return ChainedCloser{nr, r}, nil
+	return ChainedCloser{nr, reader}, nil
 }
 
-func unzip(reader io.ReadCloser) (io.ReadCloser, error) {
-	b := bytes.NewBuffer([]byte{})
-	size, err := io.Copy(b, reader)
+type ZipFileOpener struct{}
+
+func (t ZipFileOpener) tweak(reader io.ReadCloser) (io.ReadCloser, error) {
+	b, err := io.ReadAll(reader)
 	if err != nil {
 		return nil, err
 	}
 	reader.Close()
 
-	br := bytes.NewReader(b.Bytes())
-	r, err := zip.NewReader(br, size)
+	r, err := zip.NewReader(bytes.NewReader(b), int64(len(b)))
+
 	if err != nil {
 		return nil, err
 	}
@@ -80,64 +90,59 @@ func unzip(reader io.ReadCloser) (io.ReadCloser, error) {
 	return r.File[0].Open()
 }
 
-func csvHeader(r io.Reader) ([]string, io.Reader, error) {
-	br := bufio.NewReader(r)
-	bom, err := br.Peek(3)
-	if err != nil {
-		return nil, nil, err
-	}
+func csvHeader(b []byte) ([]string, error) {
 	// UTF-8 with BOM
-	if bom[0] == 0xEF && bom[1] == 0xBB && bom[2] == 0xBF {
-		br.Discard(3)
+	if b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF {
+		b = b[3:]
 	}
-	rr := csv.NewReader(br)
+	rr := csv.NewReader(bytes.NewReader(b))
 	rr.LazyQuotes = true
 	header, err := rr.Read()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return header, br, nil
+	return header, nil
 }
 
-func load(projectID string, datasetID string, tableID string, r io.ReadCloser) error {
-	header, br, err := csvHeader(r)
-	defer r.Close()
+type CloudStorageLoader struct {
+	bucketName string
+	objectName string
+}
 
-	if err != nil {
-		return err
-	}
-
+func (l CloudStorageLoader) load(b []byte) (bool, error) {
 	ctx := context.Background()
-	client, err := bigquery.NewClient(ctx, projectID)
+	client, err := storage.NewClient(ctx)
 	if err != nil {
-		return err
+		log.Printf("storage.NewClient: %v", err)
+		return false, err
 	}
-	rs := bigquery.NewReaderSource(br)
-	rs.AllowQuotedNewlines = true
+	defer client.Close()
 
-	schema := make([]*bigquery.FieldSchema, len(header))
-	var invalidCharacters = regexp.MustCompile(`[^\p{L}\p{N}\p{Pc}\p{Pd}\p{M}&%=+:'<>#|]`)
-	for i, v := range header {
-		name := invalidCharacters.ReplaceAllString(v, "_")
-		schema[i] = &bigquery.FieldSchema{Name: name, Type: bigquery.StringFieldType}
-	}
-	rs.Schema = schema
+	o := client.Bucket(l.bucketName).Object(l.objectName)
+	attrs, err := o.Attrs(ctx)
 
-	ds := client.Dataset(datasetID)
-	loader := ds.Table(tableID).LoaderFrom(rs)
-	loader.WriteDisposition = bigquery.WriteTruncate
-	job, err := loader.Run(ctx)
-	if err != nil {
-		return err
+	if err == nil {
+		sum := md5.Sum(b)
+		if bytes.Equal(sum[:], attrs.MD5) {
+			log.Println("Skipped")
+			return false, nil
+		}
+	} else if err != storage.ErrObjectNotExist {
+		log.Printf("ObjectHandle.Attrs: %v", err)
+		return false, err
 	}
-	status, err := job.Wait(ctx)
-	if err != nil {
-		return err
+
+	wc := o.NewWriter(ctx)
+
+	if _, err := wc.Write(b); err != nil {
+		log.Printf("ObjectHandle.NewWriter: %v", err)
+		return false, err
 	}
-	if status.Err() != nil {
-		return status.Err()
+	if err := wc.Close(); err != nil {
+		log.Printf("Writer.Close: %v", err)
+		return false, err
 	}
-	return nil
+	return true, nil
 }
 
 func main() {
@@ -158,137 +163,136 @@ func main() {
 	}
 }
 
-func (t Tweak) tweak(reader io.ReadCloser) (io.ReadCloser, error) {
-	var nextReader io.ReadCloser
-	var err error
+type Input struct {
+	RequestId          string            `json:"requestId"`
+	Caller             string            `json:"caller"`
+	SessionUser        string            `json:"sessionUser"`
+	UserDefinedContext map[string]string `json:"userDefinedContext"`
+	Calls              [][]any           `json:"calls"`
+}
 
-	switch t.Call {
-	case "unzip":
-		nextReader, err = unzip(reader)
-	case "convert":
-		nextReader, err = convert(t.Args["charset"], reader)
-	default:
-		return nil, fmt.Errorf("unsupported call: %s", t.Call)
+func parseCall(call []any) (*HTTPExtractor, []Tweaker, *CloudStorageLoader, error) {
+	if len(call) != 7 {
+		return nil, nil, nil, fmt.Errorf("invalid number of input fields provided.  expected 7, got  %d", len(call))
+	}
+	method, ok := call[0].(string)
+	if !ok {
+		return nil, nil, nil, fmt.Errorf("invalid method type. expected string")
+	}
+	url, ok := call[1].(string)
+	if !ok {
+		return nil, nil, nil, fmt.Errorf("invalid url type. expected string")
+	}
+	body, ok := call[2].(string)
+	if !ok {
+		return nil, nil, nil, fmt.Errorf("invalid body type. expected string")
+	}
+	isZip, ok := call[3].(bool)
+	if !ok {
+		return nil, nil, nil, fmt.Errorf("invalid unzip type. expected bool")
+	}
+	label, ok := call[4].(string)
+	if !ok {
+		return nil, nil, nil, fmt.Errorf("invalid charset type. expected string")
+	}
+	bucket, ok := call[5].(string)
+	if !ok {
+		return nil, nil, nil, fmt.Errorf("invalid bucket type. expected string")
+	}
+	object, ok := call[6].(string)
+	if !ok {
+		return nil, nil, nil, fmt.Errorf("invalid object type. expected string")
 	}
 
+	var tweakers []Tweaker
+	if isZip {
+		tweakers = append(tweakers, ZipFileOpener{})
+	}
+	if strings.ToLower(strings.TrimSpace(label)) != "utf-8" {
+		tweakers = append(tweakers, CharsetConverter{label})
+	}
+
+	return &HTTPExtractor{method, url, body}, tweakers, &CloudStorageLoader{bucket, object}, nil
+}
+
+func returnErrorMessage(w http.ResponseWriter, statusCode int, errorMessage error) {
+	data, err := json.Marshal(map[string]string{"errorMessage": errorMessage.Error()})
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
 	if err != nil {
-		log.Printf("call transformers: %v", err)
-		return nil, err
+		fmt.Fprint(w, `{"errorMessage": "json.Marshal Failed"}`)
+		return
 	}
-	return nextReader, nil
+	fmt.Fprint(w, data)
 }
 
-type Extraction struct {
-	Method string
-	Url    string
-	Body   map[string]string
-}
-type Tweak struct {
-	Call string
-	Args map[string]string
-}
-type Loading struct {
-	ProjectID string
-	DatasetID string
-	TableID   string
+type Reply struct {
+	Updated bool     `json:"updated"`
+	Header  []string `json:"header"`
 }
 
 func handler(w http.ResponseWriter, r *http.Request) {
-	var d struct {
-		PreExtraction PreExtraction
-		Extraction    Extraction
-		Tweaks        []Tweak
-		Loading       Loading
+	if r.Method != http.MethodPost {
+		returnErrorMessage(w, http.StatusBadRequest, fmt.Errorf("method Not Allowed: %v", r.Method))
+		return
 	}
+	var input Input
 
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewDecoder(r.Body).Decode(&d); err != nil {
-		log.Printf("json.NewDecoder: %v", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprintln(w, `{"error": "Internal Server Error"}`)
-		return
-	}
-	e, err := d.PreExtraction.preExtract(d.Extraction)
-	if err != nil {
-		log.Printf("preExtract: %v", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprintln(w, `{"error": "Internal Server Error"}`)
-		return
-	}
-	d.Extraction = e
-	reader, err := request(d.Extraction.Method, d.Extraction.Url, d.Extraction.Body)
-	fmt.Printf("%v", d.Extraction.Body)
-	if err != nil {
-		log.Printf("request: %v", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprintln(w, `{"error": "Internal Server Error"}`)
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		returnErrorMessage(w, http.StatusBadRequest, fmt.Errorf("json.NewDecoder.Decode: %v", err))
 		return
 	}
 
-	for _, t := range d.Tweaks {
-		reader, err = t.tweak(reader)
+	replies := make([]Reply, len(input.Calls))
+	for i, call := range input.Calls {
+		extractor, tweakers, loader, err := parseCall(call)
 		if err != nil {
-			log.Printf("tweak: %v", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			fmt.Fprintln(w, `{"error": "Internal Server Error"}`)
+			returnErrorMessage(w, http.StatusBadGateway, err)
 			return
 		}
+		reader, err := extractor.Extract()
+		if err != nil {
+			returnErrorMessage(w, http.StatusBadGateway, err)
+			return
+		}
+		for _, tweaker := range tweakers {
+			reader, err = tweaker.tweak(reader)
+			if err != nil {
+				returnErrorMessage(w, http.StatusBadGateway, err)
+				return
+			}
+		}
+
+		b, err := io.ReadAll(reader)
+		if err != nil {
+			returnErrorMessage(w, http.StatusBadGateway, err)
+			return
+		}
+		reader.Close()
+		updated, err := loader.load(b)
+		if err != nil {
+			returnErrorMessage(w, http.StatusBadGateway, err)
+			return
+		}
+		header, err := csvHeader(b)
+		if err != nil {
+			returnErrorMessage(w, http.StatusBadGateway, err)
+			return
+		}
+
+		if err != nil {
+			returnErrorMessage(w, http.StatusBadGateway, err)
+			return
+		}
+		replies[i] = Reply{updated, header}
 	}
 
-	if err := load(d.Loading.ProjectID, d.Loading.DatasetID, d.Loading.TableID, reader); err != nil {
-		log.Printf("load: %v", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprintln(w, `{"error": "Internal Server Error"}`)
+	data, err := json.Marshal(map[string][]Reply{"replies": replies})
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if err != nil {
+		fmt.Fprint(w, `{"errorMessage": "json.Marshal Failed"}`)
 		return
 	}
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintln(w, "{}")
-}
-
-func formatMap(templates map[string]string, pattern *regexp.Regexp, content string) map[string]string {
-	matches := pattern.FindAllStringSubmatchIndex(content, -1)
-
-	m := make(map[string]string)
-	for key := range templates {
-		template := templates[key]
-		var result []byte
-		for _, submatches := range matches {
-			result = pattern.ExpandString(result, template, content, submatches)
-		}
-		m[key] = string(result)
-	}
-	return m
-}
-
-type PreExtraction struct {
-	Method  string
-	Url     string
-	Body    map[string]string
-	Pattern string
-}
-
-func (p PreExtraction) preExtract(e Extraction) (Extraction, error) {
-	if p.Method == "" && p.Url == "" {
-		return e, nil
-	}
-	reader, err := request(p.Method, p.Url, p.Body)
-	if err != nil {
-		return e, err
-	}
-	defer reader.Close()
-
-	b, err := io.ReadAll(reader)
-	if err != nil {
-		log.Fatal(err)
-	}
-	content := string(b)
-	pattern := regexp.MustCompile(p.Pattern)
-
-	body := formatMap(e.Body, pattern, content)
-
-	return Extraction{
-		e.Method,
-		e.Url,
-		body,
-	}, nil
+	w.Write(data)
 }
