@@ -2,14 +2,15 @@ package main
 
 import (
 	"archive/zip"
+	"bufio"
 	"bytes"
 	"cloud.google.com/go/storage"
 	"context"
-	"crypto/md5"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"golang.org/x/net/html/charset"
+	"golang.org/x/sync/errgroup"
 	"io"
 	"log"
 	"net/http"
@@ -90,59 +91,63 @@ func (t ZipFileOpener) tweak(reader io.ReadCloser) (io.ReadCloser, error) {
 	return r.File[0].Open()
 }
 
-func csvHeader(b []byte) ([]string, error) {
-	// UTF-8 with BOM
-	if b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF {
-		b = b[3:]
-	}
-	rr := csv.NewReader(bytes.NewReader(b))
-	rr.LazyQuotes = true
-	header, err := rr.Read()
-	if err != nil {
-		return nil, err
-	}
-	return header, nil
-}
-
 type CloudStorageLoader struct {
 	bucketName string
 	objectName string
 }
 
-func (l CloudStorageLoader) load(b []byte) (bool, error) {
+func (l CloudStorageLoader) load(r io.Reader) ([]string, error) {
 	ctx := context.Background()
 	client, err := storage.NewClient(ctx)
 	if err != nil {
 		log.Printf("storage.NewClient: %v", err)
-		return false, err
+		return nil, err
 	}
 	defer client.Close()
 
 	o := client.Bucket(l.bucketName).Object(l.objectName)
-	attrs, err := o.Attrs(ctx)
-
-	if err == nil {
-		sum := md5.Sum(b)
-		if bytes.Equal(sum[:], attrs.MD5) {
-			log.Println("Skipped")
-			return false, nil
-		}
-	} else if err != storage.ErrObjectNotExist {
-		log.Printf("ObjectHandle.Attrs: %v", err)
-		return false, err
-	}
-
 	wc := o.NewWriter(ctx)
+	pr, pw := io.Pipe()
+	mw := io.MultiWriter(wc, pw)
 
-	if _, err := wc.Write(b); err != nil {
-		log.Printf("ObjectHandle.NewWriter: %v", err)
-		return false, err
+	var g errgroup.Group
+	g.Go(func() error {
+		if _, err := io.Copy(mw, r); err != nil {
+			log.Printf("io.Copy: %v", err)
+			return err
+		}
+		if err := wc.Close(); err != nil {
+			log.Printf("Writer.Close: %v", err)
+			return err
+		}
+		defer pw.Close()
+		return nil
+	})
+
+	br := bufio.NewReader(pr)
+	bom, err := br.Peek(3)
+	if err != nil {
+		log.Printf("bufio.Reader.Peek: %v", err)
+		return nil, err
 	}
-	if err := wc.Close(); err != nil {
-		log.Printf("Writer.Close: %v", err)
-		return false, err
+	if bom[0] == 0xEF && bom[1] == 0xBB && bom[2] == 0xBF {
+		br.Discard(3)
 	}
-	return true, nil
+	cr := csv.NewReader(br)
+	cr.LazyQuotes = true
+	header, err := cr.Read()
+	if err != nil {
+		log.Printf("csv.Reader.Read: %v", err)
+		return nil, err
+	}
+	io.Copy(io.Discard, br)
+	defer pr.Close()
+
+	if err := g.Wait(); err != nil {
+		log.Printf("errgroup.Group.Wait: %v", err)
+		return nil, err
+	}
+	return header, nil
 }
 
 func main() {
@@ -227,8 +232,7 @@ func returnErrorMessage(w http.ResponseWriter, statusCode int, errorMessage erro
 }
 
 type Reply struct {
-	Updated bool     `json:"updated"`
-	Header  []string `json:"header"`
+	Header []string `json:"header"`
 }
 
 func handler(w http.ResponseWriter, r *http.Request) {
@@ -263,18 +267,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		b, err := io.ReadAll(reader)
-		if err != nil {
-			returnErrorMessage(w, http.StatusBadGateway, err)
-			return
-		}
-		reader.Close()
-		updated, err := loader.load(b)
-		if err != nil {
-			returnErrorMessage(w, http.StatusBadGateway, err)
-			return
-		}
-		header, err := csvHeader(b)
+		header, err := loader.load(reader)
 		if err != nil {
 			returnErrorMessage(w, http.StatusBadGateway, err)
 			return
@@ -284,7 +277,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 			returnErrorMessage(w, http.StatusBadGateway, err)
 			return
 		}
-		replies[i] = Reply{updated, header}
+		replies[i] = Reply{header}
 	}
 
 	data, err := json.Marshal(map[string][]Reply{"replies": replies})
