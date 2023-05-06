@@ -5,6 +5,7 @@ go 1.18
 require (
 	cloud.google.com/go/storage v1.28.1
 	golang.org/x/net v0.9.0
+	golang.org/x/sync v0.1.0
 )
 
 require (
