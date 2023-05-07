@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"golang.org/x/net/html/charset"
-	"golang.org/x/sync/errgroup"
 	"io"
 	"log"
 	"net/http"
@@ -107,24 +106,7 @@ func (l CloudStorageLoader) load(r io.Reader) ([]string, error) {
 
 	o := client.Bucket(l.bucketName).Object(l.objectName)
 	wc := o.NewWriter(ctx)
-	pr, pw := io.Pipe()
-	mw := io.MultiWriter(wc, pw)
-
-	var g errgroup.Group
-	g.Go(func() error {
-		if _, err := io.Copy(mw, r); err != nil {
-			log.Printf("io.Copy: %v", err)
-			return err
-		}
-		if err := wc.Close(); err != nil {
-			log.Printf("Writer.Close: %v", err)
-			return err
-		}
-		defer pw.Close()
-		return nil
-	})
-
-	br := bufio.NewReader(pr)
+	br := bufio.NewReader(io.TeeReader(r, wc))
 	bom, err := br.Peek(3)
 	if err != nil {
 		log.Printf("bufio.Reader.Peek: %v", err)
@@ -141,10 +123,9 @@ func (l CloudStorageLoader) load(r io.Reader) ([]string, error) {
 		return nil, err
 	}
 	io.Copy(io.Discard, br)
-	defer pr.Close()
 
-	if err := g.Wait(); err != nil {
-		log.Printf("errgroup.Group.Wait: %v", err)
+	if err := wc.Close(); err != nil {
+		log.Printf("Writer.Close: %v", err)
 		return nil, err
 	}
 	return header, nil
